@@ -35,3 +35,6 @@ build/
 *.log
 tmp/
 temp/
+
+# Cloudera CSA parcel wheels, copied from the gateway (large, redistributable only within the cluster)
+vendor/csa-wheels/

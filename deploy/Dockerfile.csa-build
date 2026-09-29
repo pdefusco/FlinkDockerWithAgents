@@ -1,0 +1,350 @@
+# Build-only image: produces Flink Agents artifacts for Cloudera CSA (Flink 1.20 on YARN).
+#
+# This image is never deployed. It is a cross-compilation vehicle: run it, copy
+# /out, throw it away. See scripts/build_csa_bundle.sh.
+#
+# ############################################################################
+# STAGE 3 IS NO LONGER THE PRIMARY PATH. Stages 1-2 still are.
+#
+# Stages 1-2 build the flink-agents JARS and the Python WHEEL from source, and both are
+# still required — nothing else produces them.
+#
+# Stage 3 builds a 626MB self-contained conda environment carrying its own interpreter,
+# libpython, PyFlink, pemja, beam, numpy and pyarrow. It was written on the assumption
+# that CSA nodes have no usable Python. That assumption is FALSE. Verified on pdf-pwc
+# (CSA 1.18.0.0 / Flink 1.20.5), on the gateway AND all three workers independently:
+# Cloudera pip-installs a complete matched stack into
+# /usr/local/lib64/python3.11/site-packages (apache-flink 1.20.5, pemja 0.5.7, beam
+# 2.48.0, numpy 1.24.4, pyarrow 11.0.0, pandas 2.2.3) with /usr/lib64/libpython3.11.so
+# present, on every node.
+#
+# So the live path is scripts/build_csa_venv_gateway.sh, which runs ON THE GATEWAY and
+# creates a --system-site-packages venv inheriting that stack: 13MB instead of 626MB, no
+# cross-compilation, no conda-pack relocation, and — the real point — no guessed pemja
+# version. pemja is a JNI bridge whose two halves must match, and Cloudera PATCHES the
+# pin (their apache-flink 1.20.5 needs pemja>=0.5.7,<0.5.8; upstream 1.20.1 pins 0.4.1).
+# Stage 3 resolved from PyPI and so produced pemja 0.4.1: it installed clean, imported
+# clean, passed a clean-RHEL9 container check, and would have failed inside a TaskManager.
+#
+# Stage 3 is KEPT, not deleted: it is the fallback for a cluster whose nodes lack the
+# system stack, and for the CSA-Operator-on-AKS path. Do not "fix" its pins against PyPI
+# — if it is ever needed again, build it from the parcel's own wheel set at
+# $FLINK_HOME/lib/flink-python-source/ (44 cp311 wheels), which vendor/csa-wheels/ holds
+# a copy of.
+# ############################################################################
+#
+# Why a separate Dockerfile from deploy/Dockerfile:
+#   deploy/Dockerfile targets the local Docker cluster — Flink 2.1 + Python 3.12,
+#   and Flink itself supplies PyFlink from the image's bundled pyflink.zip. CSA on
+#   Runtime 7.3.2 ships Apache Flink 1.20.1 on YARN, with no custom image and a
+#   read-only parcel directory. Flink Agents publishes a per-Flink-minor dist jar,
+#   so the 2.1 jar is unusable there and everything must be rebuilt for 1.20.
+#
+# Two hard constraints drive the choices below:
+#
+#  1. Python 3.11, not 3.12. PyFlink 1.20 supports CPython 3.8-3.11 only, so the
+#     local 3.12 choice cannot carry over.
+#
+#  2. The Python environment must be SELF-CONTAINED, including its own interpreter
+#     and libpython. YARN ships it as an archive to nodes that have no matching
+#     Python installed. A stdlib venv will not do: `bin/python` is a symlink to the
+#     system interpreter, and even `--copies` copies only the binary, not
+#     libpython3.11.so — so pemja (a JNI extension that embeds libpython) fails to
+#     load on the TaskManager. A conda environment bundles the interpreter and
+#     libpython, and conda-pack exists precisely to relocate one. Hence miniforge.
+#
+# glibc: built on RHEL8-family (glibc 2.28). CONFIRMED against the pwc-test DataHub
+# (Runtime 7.3.2, applied-ai-cdp-env): nodes run RHEL9 / ami-05c1ccbf9d3b88407, i.e.
+# glibc 2.34, on m5.2xlarge. Rocky 8 is kept deliberately rather than moved to 9:
+# glibc is backward-compatible, so 2.28-built binaries load on 2.34, and staying on 8
+# keeps one bundle valid for RHEL8 and RHEL9 nodes alike. Moving the base to 9 would
+# silently make the artifact unusable on any 7.2.x/RHEL8 cluster.
+#
+# Java: the cluster nodes report Java 17; the jars here are built with JDK 11. Flink
+# 1.20 supports both, and JDK 11 bytecode runs on a 17 JVM, so this is intentional —
+# it keeps the build target at the lower bound rather than the cluster's version.
+#
+# Always build for the cluster's architecture — a Mac needs --platform linux/amd64
+# (see scripts/build_csa_bundle.sh).
+
+ARG BASE_IMAGE=rockylinux/rockylinux:8
+FROM ${BASE_IMAGE}
+
+ARG FLINK_AGENTS_VERSION=release-0.3
+# Flink minor that CSA on Runtime 7.3.2 ships. Selects the dist/flink-<minor>
+# Maven module and the on-disk jar layout the runtime looks for.
+ARG FLINK_MAJOR_MINOR=1.20
+# Patch version pip-installs apache-flink at. Must share MAJOR.MINOR with the
+# cluster: the Flink Agents jar and PyFlink are compiled against the same minor.
+ARG FLINK_PATCH_VERSION=1.20.1
+ARG PYTHON_VERSION=3.11
+# Rocky/RHEL 8's dnf ships Maven 3.5.4, but flink-agents' build uses
+# maven-clean-plugin 3.4.1, which requires Maven >= 3.6.3 and fails on the very first
+# goal with PluginIncompatibleException. deploy/Dockerfile does not hit this only
+# because its Debian base has 3.8.7. So install Maven from Apache instead of dnf.
+# archive.apache.org is used deliberately: the dlcdn mirrors drop non-current versions.
+ARG MAVEN_VERSION=3.9.9
+
+ENV FLINK_AGENTS_VERSION=${FLINK_AGENTS_VERSION} \
+    FLINK_MAJOR_MINOR=${FLINK_MAJOR_MINOR} \
+    FLINK_PATCH_VERSION=${FLINK_PATCH_VERSION}
+
+# Toolchain. gcc/gcc-c++ and the conda env's headers build pemja from source
+# (no wheels are published for it on this platform).
+RUN dnf -y install --setopt=install_weak_deps=False \
+        git curl bzip2 tar gzip unzip which make \
+        gcc gcc-c++ \
+        java-11-openjdk-devel \
+    && dnf clean all
+
+ENV JAVA_HOME=/usr/lib/jvm/java-11-openjdk
+
+RUN curl -fsSL -o /tmp/maven.tar.gz \
+        "https://archive.apache.org/dist/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz" \
+    && mkdir -p /opt/maven \
+    && tar xzf /tmp/maven.tar.gz -C /opt/maven --strip-components=1 \
+    && rm -f /tmp/maven.tar.gz
+ENV PATH=/opt/maven/bin:$PATH
+# Assert the version, so a mirror serving something unexpected fails here rather than
+# 10 seconds into the Maven build with a confusing plugin error.
+RUN mvn -version && mvn -version | grep -q "Apache Maven ${MAVEN_VERSION}"
+# Flink Agents' build enforces spotless formatting; irrelevant when consuming a tag.
+ENV SKIP_SPOTLESS_CHECK=true
+
+# --- Stage 1: a modern Python, needed by the build itself -----------------------
+# Installed BEFORE the Java build because tools/build.sh ends by building the Python
+# wheel and calls bare `pip` (to fetch uv). RHEL8 has no `pip` on PATH at all — only
+# dnf's platform-python 3.6 — so the Maven reactor would succeed and then the build
+# would die at the last step with "pip: command not found" (exit 127).
+# Miniforge (conda-forge defaults) avoids the Anaconda ToS entirely.
+RUN curl -fsSL -o /tmp/miniforge.sh \
+        "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-$(uname -m).sh" \
+    && bash /tmp/miniforge.sh -b -p /opt/conda \
+    && rm -f /tmp/miniforge.sh
+ENV PATH=/opt/conda/bin:$PATH
+RUN pip --version && python --version
+
+# --- Stage 2: build the Flink Agents jars + Python wheel from source -----------
+# release-0.3 publishes dist modules for common, flink-1.20, 2.0, 2.1, 2.2, 2.3.
+# flink-1.20 is what makes CSA a viable target at all.
+RUN git clone --depth 1 --branch "${FLINK_AGENTS_VERSION}" \
+        https://github.com/apache/flink-agents.git /tmp/flink-agents \
+    && cd /tmp/flink-agents \
+    && bash ./tools/build.sh \
+    && mkdir -p /out/jars /out/wheel \
+    && cp dist/common/target/flink-agents-dist-common-*.jar /out/jars/ \
+    && cp "dist/flink-${FLINK_MAJOR_MINOR}/target/flink-agents-dist-flink-${FLINK_MAJOR_MINOR}"-*-thin.jar /out/jars/ \
+    && cp python/dist/*.whl /out/wheel/ \
+    && ls -la /out/jars /out/wheel
+
+# --- Stage 3: the self-contained Python environment that ships to YARN ----------
+# Separate from the conda base above: base is build tooling, /opt/agentenv is the
+# runtime that gets conda-packed. Keeping them apart stops uv/build tooling from
+# bloating the archive that has to travel to every TaskManager.
+#
+# setuptools is pinned below 82 because >=82 drops pkg_resources, which
+# apache-beam (a PyFlink runtime dependency) still imports. Constraining both the
+# install set and build isolation is what deploy/Dockerfile does, for the same reason.
+#
+# DO NOT re-add pins for apache-beam, pemja, numpy, pyarrow or avro here. They were
+# copied from deploy/Dockerfile, which targets Flink 2.1, and they are wrong for 1.20:
+#
+#   deploy/Dockerfile (Flink 2.1)   apache-flink 1.20.1 actually requires
+#   -----------------------------   ----------------------------------------
+#   apache-beam>=2.54.0,<=2.61.0    apache-beam>=2.43.0,<2.49.0
+#   pemja>=0.6.0,<0.7.0             pemja==0.4.1   (an exact pin)
+#
+# The beam pin made this step fail with ResolutionImpossible. The pemja pin was worse:
+# it would have resolved happily and then failed at runtime on the TaskManager, because
+# the parcel's flink-python jar carries the pemja classes that match 0.4.1.
+#
+# Verified on PyPI that cp311 wheels exist for apache-beam 2.47/2.48 and pemja 0.4.1,
+# so Python 3.11 remains viable inside that narrower window. Beam 2.46 is cp310-only,
+# so pip has exactly two usable beam versions here — a reason to leave resolution alone.
+#
+# flink-agents 0.3 constrains neither apache-flink nor pemja, so PyFlink's own metadata
+# is the single source of truth for this set. Let pip resolve it.
+#
+# The flink-agents wheel is installed with --no-deps and its dependencies supplied
+# explicitly, because its full dependency set is dominated by LLM and vector-store
+# integrations this milestone does not use:
+#
+#   chromadb==1.0.21 (pulls onnxruntime, tokenizers, grpcio), mem0ai>=0.1.43,
+#   openai, anthropic, dashscope, ollama, mcp, tree-sitter, tree-sitter-bash
+#
+# Two reasons to leave them out, not one:
+#   - agentenv.tar.gz is shipped by python.archives to EVERY TaskManager on EVERY
+#     job submission. Onnxruntime-class dependencies are pure transfer cost here.
+#   - they do not fit. The Docker Desktop VM is 60GB hard-capped and was down to
+#     4.2GB free when this was written; the full set peaks at roughly 4-5GB across
+#     the env plus the conda-pack tarball, which is what killed an earlier attempt
+#     with "No space left on device".
+#
+# What is kept is what flink_agents imports on the workflow (non-LLM) path.
+# The import self-check below is the guard: if any of these is in fact needed
+# eagerly, the build fails HERE rather than on a TaskManager, which is the whole
+# point of doing it this way. To restore the full set, drop the --no-deps line.
+#
+# `importlib_resources` is in this list because of an UPSTREAM PACKAGING BUG, not
+# because we want it: flink_agents/api/execution_environment.py:25 does
+# `from importlib_resources import files` at module scope, but flink-agents 0.3 does
+# not declare it as a dependency. It normally arrives transitively via chromadb, so
+# the omission is invisible until you install with --no-deps. Do not remove it
+# assuming pip will supply it.
+#
+# setuptools is installed by CONDA here, not pip, and deliberately so. `conda create`
+# brings its own conda-managed setuptools (84.0.0), and having pip then install
+# `setuptools<82` downgrades it by overwriting conda-managed files. The env still
+# works, but conda-pack refuses to pack it and fails the build late with:
+#   CondaPackError: Files managed by conda were found to have been deleted/overwritten
+#   - setuptools 84.0.0: lib/python3.11/site-packages/setuptools-84.0.0-*.egg-info/...
+# Pinning it at conda-create time means conda owns a version already inside the
+# required range, so pip never replaces it and the two never disagree. PIP_CONSTRAINT
+# stays below to stop a transitive dependency dragging setuptools back up past 82.
+RUN conda create -y -p /opt/agentenv "python=${PYTHON_VERSION}" \
+        'setuptools>=75.3,<82' \
+    && printf 'setuptools>=75.3,<82\n' > /tmp/pip-constraint.txt \
+    && export PIP_CONSTRAINT=/tmp/pip-constraint.txt \
+              PIP_BUILD_CONSTRAINT=/tmp/pip-constraint.txt \
+    && /opt/agentenv/bin/python -m pip install --no-cache-dir \
+        "apache-flink==${FLINK_PATCH_VERSION}" \
+        'requests>=2.32.0' \
+        'kafka-python>=2.0.2' \
+        'python-dotenv>=1.0.0' \
+        'ruamel.yaml' \
+    && /opt/agentenv/bin/python -m pip install --no-cache-dir \
+        'pydantic==2.11.4' \
+        'pyyaml==6.0.2' \
+        'docstring-parser==0.16' \
+        'find_libpython' \
+        'googleapis-common-protos<1.72.1' \
+        'importlib_resources' \
+    && /opt/agentenv/bin/python -m pip install --no-cache-dir --no-deps \
+        /out/wheel/*.whl \
+    && rm -f /tmp/pip-constraint.txt
+
+# Unlike the local image, apache-flink is pip-installed here, so importlib.metadata
+# reports a real version and patch_flink_agents_version()'s metadata fabrication is
+# unnecessary on this path.
+#
+# Pre-stage the jars into the env's site-packages in the layout
+# attach_flink_agents_jars() expects (flink_agents/lib/{common,flink-<minor>}/).
+# ensure_flink_agents_jars() normally does this at runtime from a flink-agents
+# source checkout; baking it in means the gateway needs no source tree.
+RUN SP="$(/opt/agentenv/bin/python -c 'import sysconfig;print(sysconfig.get_paths()["purelib"])')" \
+    && mkdir -p "$SP/flink_agents/lib/common" "$SP/flink_agents/lib/flink-${FLINK_MAJOR_MINOR}" \
+    && cp /out/jars/flink-agents-dist-common-*.jar "$SP/flink_agents/lib/common/" \
+    && cp "/out/jars/flink-agents-dist-flink-${FLINK_MAJOR_MINOR}"-*-thin.jar \
+          "$SP/flink_agents/lib/flink-${FLINK_MAJOR_MINOR}/" \
+    && for d in "$SP/flink_agents/lib" "$SP/flink_agents/lib/common" \
+                "$SP/flink_agents/lib/flink-${FLINK_MAJOR_MINOR}"; do \
+           touch "$d/__init__.py"; \
+       done \
+    && echo "$SP" > /out/site-packages-path.txt
+
+# Fail the build rather than ship an environment that cannot import its own runtime.
+#
+# This is the guard for the --no-deps install above. It imports the exact
+# flink_agents.api modules that examples/agents/run_workflow_cluster_csa.py and
+# workflow_counter.py resolve at job-graph build time, so an LLM/vector-store
+# dependency that turns out to be needed EAGERLY surfaces here. Without this the
+# trim would be a gamble settled on a TaskManager, where the traceback is buried in
+# YARN container logs. `decorators` matters most: `tool` is where the integration
+# machinery lives, so it is the import most likely to reach a dropped package.
+#
+# Each import is attempted independently and ALL failures are collected before
+# exiting. A bare `import a, b, c` stops at the first missing module, which turns
+# trimming into one-missing-package-per-rebuild — and a rebuild here costs minutes
+# because changing the pip command invalidates its layer. Collecting the whole set
+# in one pass is what makes the --no-deps approach practical to converge.
+RUN /opt/agentenv/bin/python - <<'PY'
+import importlib, sys
+
+# (module, attributes that must resolve). The flink_agents.api entries are exactly
+# what examples/agents/run_workflow_cluster_csa.py and workflow_counter.py resolve
+# at job-graph build time.
+#
+# "pemja" here is the pure-Python package. Do NOT add "pemja_core": that is the JNI
+# extension and importing it outside a JVM always fails with
+#   ImportError: pemja_core...so: undefined symbol: JNI_GetCreatedJavaVMs
+# since the JVM supplies that symbol. It is not a packaging fault, and adding it here
+# would fail every build. The JNI layer is only testable on a TaskManager.
+CHECKS = [
+    ("pemja", ()),
+    ("pyflink", ()),
+    ("flink_agents", ()),
+    ("apache_beam", ()),
+    ("numpy", ()),
+    ("pyarrow", ()),
+    ("flink_agents.api.execution_environment", ("AgentsExecutionEnvironment",)),
+    ("flink_agents.api.agents.agent", ("Agent",)),
+    ("flink_agents.api.decorators", ("action", "tool")),
+    ("flink_agents.api.events.event", ("Event", "InputEvent", "OutputEvent")),
+    ("flink_agents.api.runner_context", ("RunnerContext",)),
+]
+
+missing, broken = {}, []
+for name, attrs in CHECKS:
+    try:
+        mod = importlib.import_module(name)
+    except ModuleNotFoundError as e:
+        # e.name is the package to add to the explicit dep list above.
+        missing.setdefault(e.name, []).append(name)
+        continue
+    except Exception as e:
+        broken.append(f"{name}: {type(e).__name__}: {e}")
+        continue
+    for a in attrs:
+        if not hasattr(mod, a):
+            broken.append(f"{name}: missing attribute {a!r}")
+
+if missing or broken:
+    print("\n=== SELF-CHECK FAILED ===", file=sys.stderr)
+    for pkg, needed_by in sorted(missing.items()):
+        print(f"  missing package: {pkg}  (needed by: {', '.join(needed_by)})",
+              file=sys.stderr)
+    for b in broken:
+        print(f"  broken import  : {b}", file=sys.stderr)
+    if missing:
+        print("\nAdd these to the explicit pip install list in Stage 3 — the "
+              "--no-deps install of the flink-agents wheel does not supply them.\n"
+              "Candidates: " + " ".join(sorted(missing)), file=sys.stderr)
+    sys.exit(1)
+
+from importlib.metadata import version
+print("python      :", sys.version.split()[0])
+print("apache-flink:", version("apache-flink"))
+print("apache-beam :", version("apache-beam"))
+print("pemja       :", version("pemja"))
+print("flink_agents:", version("flink-agents"))
+print("workflow API imports: ok")
+PY
+
+# conda-pack rewrites absolute prefixes so the archive unpacks anywhere — which is
+# what YARN needs, since it extracts into a per-container working directory.
+#
+# Invoke the standalone `conda-pack` executable, NOT `conda pack`. The subcommand
+# form is what every conda-pack tutorial shows, but this conda is new enough to have
+# dropped that plugin-style dispatch: it fails with
+#   conda: error: argument COMMAND: invalid choice: 'pack'
+# while listing every other subcommand, which reads like a broken install rather than
+# a renamed entry point. The package is installed into the BASE env (/opt/conda), and
+# packs the separate /opt/agentenv named by -p.
+RUN conda install -y -c conda-forge conda-pack \
+    && /opt/conda/bin/conda-pack --version \
+    && /opt/conda/bin/conda-pack -p /opt/agentenv -o /out/agentenv.tar.gz \
+         --compress-level 6 \
+    && ls -la /out/agentenv.tar.gz \
+    && du -sh /out/agentenv.tar.gz
+
+# Record exactly what was built, so the runbook and the cluster can be cross-checked.
+RUN { echo "flink_agents_version=${FLINK_AGENTS_VERSION}"; \
+      echo "flink_major_minor=${FLINK_MAJOR_MINOR}"; \
+      echo "apache_flink=${FLINK_PATCH_VERSION}"; \
+      echo "python=${PYTHON_VERSION}"; \
+      echo "base_image=$(cat /etc/os-release | sed -n 's/^PRETTY_NAME=//p' | tr -d '\"')"; \
+      echo "arch=$(uname -m)"; \
+      echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"; \
+    } > /out/BUILD-INFO.txt && cat /out/BUILD-INFO.txt
+
+WORKDIR /out
