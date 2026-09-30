@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
-"""Cluster runner for ``workflow_counter`` on Cloudera CSA (Flink 1.20 on YARN).
+"""Cluster runner for a single agent on Cloudera CSA (Flink 1.20 on YARN).
 
 The CSA counterpart of ``run_workflow_cluster.py``. The pipeline is deliberately
-identical — from_collection -> apply(CounterAgent) -> print — so that any failure is
-attributable to the deployment, not to the agent. Differences from the Docker runner:
+minimal — from_collection -> apply(<Agent>) -> print — so that any failure is
+attributable to the deployment, not to the agent. Point the import below at whichever
+agent module you are deploying; keep the pipeline shape as it is.
+
+Note this filename is referenced in two places, so renaming it is not free:
+``scripts/build_csa_bundle.sh`` copies it into the bundle by name, and
+``scripts/submit_agent_csa.sh`` defaults ``ENTRY`` to it.
+
+Differences from the Docker runner:
 
 * No ``/opt/flink`` on sys.path. ``-pyfs agentcode.zip`` puts the shipped modules
   there; only this script's own directory needs adding, for a direct local run.
@@ -102,7 +109,7 @@ def main() -> None:
 
     from flink_agents.api.execution_environment import AgentsExecutionEnvironment
 
-    from examples.agents.workflow_counter import CounterAgent
+    from examples.agents.threshold_monitor import ThresholdMonitorAgent
 
     env = StreamExecutionEnvironment.get_execution_environment()
     env.set_parallelism(1)
@@ -114,9 +121,9 @@ def main() -> None:
         input=stream,
         key_selector=lambda row: row["key"],
     )
-    out = keyed.apply(CounterAgent()).to_datastream()
+    out = keyed.apply(ThresholdMonitorAgent()).to_datastream()
     out.print()
-    agents_env.execute("Ratatoskr Workflow Counter (CSA)")
+    agents_env.execute("Ratatoskr Threshold Monitor (CSA)")
 
 
 if __name__ == "__main__":
